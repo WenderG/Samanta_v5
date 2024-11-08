@@ -1,0 +1,554 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+//--------------------Display LCD---------------------------------
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // Endereço I2C do display e dimensões (20 colunas, 4 linhas)
+
+// Definindo o caractere personalizado para o retângulo preenchido
+byte retangulo0[8] = {
+  B11111,
+  B11111,
+  B11111,
+  B11111,
+  B11111,
+  B11111,
+  B11111,
+  B11111
+};
+
+byte retangulo1[8] = {
+  B11111,
+  B11111,
+  B11000,
+  B11000,
+  B11000,
+  B11000,
+  B11000,
+  B11000
+};
+
+byte retangulo2[8] = {
+  B11111,
+  B11111,
+  B00011,
+  B00011,
+  B00011,
+  B00011,
+  B00011,
+  B00011
+};
+
+byte retangulo3[8] = {
+  B11000,
+  B11000,
+  B11000,
+  B11000,
+  B11000,
+  B11000,
+  B11111,
+  B11111
+};
+
+byte retangulo4[8] = {
+  B00011,
+  B00011,
+  B00011,
+  B00011,
+  B00011,
+  B00011,
+  B11111,
+  B11111
+};
+
+byte retangulo5[8] = {
+  B11111,
+  B11111,
+  B00011,
+  B00110,
+  B01100,
+  B11000,
+  B11111,
+  B11111
+};
+
+byte retangulo6[8] = {
+  B11111,
+  B11111,
+  B11111,
+  B11111,
+  B00000,
+  B00000,
+  B00000,
+  B00000,
+};
+
+byte retangulo7[8] = {
+  B00000,
+  B00000,
+  B00000,
+  B00000,
+  B11111,
+  B11111,
+  B11111,
+  B11111
+};
+
+//---------------------------------------------------------
+int sensorTemp = A0;  // Entrada analógica do sensor de temperatura
+int sensorSolo = A1;  // Entrada analógica do sensor de umidade do solo
+int sensorLum = A2;   // Entrada analógica do sensor de luminosidade
+
+const int rele = 2;   // Pino conectado ao relé
+
+bool pausa = false;  // Define se o relé está em pausa
+bool releDesligadoRecentemente = false; // Indica se o relé foi desligado recentemente
+unsigned long tempoAnterior = 0;    // Para controle do loop sem uso de delay()
+unsigned long tempoInicio = 0;      // Armazena o tempo em que o relé foi ativado
+unsigned long tempoDesligado = 0;   // Armazena o tempo em que o relé foi desligado
+unsigned long ultimoEnvio = 0;      // Armazena o tempo do último envio para o servidor
+unsigned long intervaloLeitura = 1000;     // Intervalo entre leituras dos sensores
+unsigned long intervaloEnvio = 300000;     // Intervalo de envio para o ESP01 (5 minutos = 300000 milissegundos)
+
+int ultimaUmidade = -1;   // Armazena o valor da última leitura de umidade
+
+// Configuração do ESP01
+SoftwareSerial espSerial(10, 11); // RX, TX
+const char* ssid = "gonsales";        // SSID da rede Wi-Fi
+const char* password = "tronodeferro"; // Senha da rede Wi-Fi
+const char* server = "192.168.0.21";   // Endereço do servidor
+
+void setup() {
+  lcd.init();                      // Inicializa o display
+  lcd.backlight();                 // Liga o backlight
+
+  lcd.createChar(0, retangulo0);
+  lcd.createChar(1, retangulo1);
+  lcd.createChar(2, retangulo2);
+  lcd.createChar(3, retangulo3);
+  lcd.createChar(4, retangulo4);
+  lcd.createChar(5, retangulo5);
+  lcd.createChar(6, retangulo6);
+  lcd.createChar(7, retangulo7);
+  lcd.begin(20, 4);                // Inicializa o display com 20 colunas e 4 linhas
+
+  lcd.clear();
+
+  lcd.setCursor(6, 0);
+  lcd.print("SAMANTA");
+
+  lcd.setCursor(5, 2);
+  lcd.print("Carregando");
+
+  pinMode(rele, OUTPUT);
+  digitalWrite(rele, LOW);
+
+  Serial.begin(9600);
+  espSerial.begin(9600);
+
+  // Configura o ESP01
+  sendATCommand("AT+CWMODE=1", 2000);
+  delay(2000);
+  char connectCommand[100];
+  sprintf(connectCommand, "AT+CWJAP=\"%s\",\"%s\"", ssid, password);
+  sendATCommand(connectCommand, 10000);
+  delay(2000);
+
+  piscadinha();
+}
+
+void loop() {
+  unsigned long tempoAtual = millis();
+
+  // Faz leituras dos sensores a cada intervalo definido
+  if (tempoAtual - tempoAnterior >= intervaloLeitura) {
+    float temperaturaC;
+    int umidade;
+    int luminosidade;
+    lerSensores(temperaturaC, umidade, luminosidade);
+    mostrarDisplay(temperaturaC, umidade, luminosidade);
+
+    // Lógica do relé baseada na umidade
+    controlarRele(umidade);
+
+    // Envio de dados para o servidor a cada 5 minutos
+    if (tempoAtual - ultimoEnvio >= intervaloEnvio) {
+      enviarDadosParaServidor(temperaturaC, umidade, luminosidade);
+      ultimoEnvio = tempoAtual;  // Atualiza o tempo do último envio
+    }
+
+    tempoAnterior = tempoAtual;
+  }
+}
+
+//-------------------------Leitura de Sensores--------------------------------
+void lerSensores(float &temperaturaC, int &umidade, int &luminosidade) {
+  umidade = map(analogRead(sensorSolo), 0, 1024, 100, 0); // Mapeia a leitura do sensor de umidade do solo para o intervalo de 0 a 100
+  luminosidade = analogRead(sensorLum);
+  int tensaoTemp = analogRead(sensorTemp); 
+  float tensao = tensaoTemp * 5.0 / 1024.0;
+  temperaturaC = ((tensao - 0.5) * 100.0);
+}
+
+//-------------------------Controle do Relé------------------------------------
+void controlarRele(int umidade) {
+  // Verifica se o relé foi desligado recentemente e espera 5 minutos antes de reativá-lo
+  if (releDesligadoRecentemente && (millis() - tempoDesligado < 300000)) { // 5 minutos = 300000 milissegundos
+    digitalWrite(rele, LOW); // Mantém o relé desligado
+    return; // Sai da função antes de verificar as outras condições
+  }
+
+  // Se a umidade estiver abaixo de 20%, ativa o relé
+  if (umidade < 20 && !pausa) {
+    digitalWrite(rele, HIGH); // Ativa o relé
+    pausa = true;
+    tempoInicio = millis();
+    ultimaUmidade = umidade;  // Armazena o valor da última umidade lida
+  }
+
+  // Se a umidade estiver com 60%, desativa o relé
+  if (umidade >= 60) {
+    digitalWrite(rele, LOW); // Desativa o relé
+    pausa = false;
+    releDesligadoRecentemente = false; // Permite que o relé seja ativado novamente
+  }
+
+  // Desativa o relé após 2 minutos de ativação, independente da umidade
+  if (pausa && (millis() - tempoInicio >= 120000)) { // 2 minutos = 120000 milissegundos
+    digitalWrite(rele, LOW); // Desativa o relé
+    pausa = false;
+    tempoDesligado = millis(); // Marca o tempo em que o relé foi desligado
+    releDesligadoRecentemente = true; // Marca que o relé foi desligado recentemente
+  }
+}
+
+//-------------------------Envio de Dados para o Servidor---------------------
+void enviarDadosParaServidor(float temperaturaC, int umidade, int luminosidade) {
+  // Formatação da requisição HTTP
+  String httpRequest = "GET /ProjetoSamanta/receberDados.php?temperatura=" + String(temperaturaC, 2) +
+                       "&umidade=" + String(umidade) +
+                       "&luminosidade=" + String((luminosidade / 1023.0) * 100, 2) +
+                       " HTTP/1.1\r\nHost: " + server + "\r\nConnection: close\r\n\r\n";
+
+  // Envio de dados
+  String cipStartCommand = "AT+CIPSTART=\"TCP\",\"" + String(server) + "\",80";
+  sendATCommand(cipStartCommand, 5000);
+
+  String cipSendCommand = "AT+CIPSEND=" + String(httpRequest.length());
+  sendATCommand(cipSendCommand, 2000);
+
+  espSerial.print(httpRequest);
+  delay(2000);
+  sendATCommand("AT+CIPCLOSE", 2000);
+}
+
+//----------------------------Funções AT------------------------------------
+bool sendATCommand(String command, unsigned long timeout) {
+  espSerial.println(command);
+  unsigned long startTime = millis();
+  while (millis() - startTime < timeout) {
+    if (espSerial.available()) {
+      String response = espSerial.readString();
+      Serial.println(response); // Para depuração
+      if (response.indexOf("OK") != -1) {
+        return true; // O comando foi bem-sucedido
+      }
+    }
+  }
+  return false; // O comando falhou
+}
+
+//----------------------------Display---------------------------------------
+void mostrarDisplay(float temp, int umidade, int luminosidade) {
+  float porcenLum = (luminosidade / 1023.0) * 100;
+
+  if(porcenLum < 50){
+    dormindo();
+  }
+
+  if (temp < 15.0){
+    frio();
+  }
+
+  if (umidade > 60.0) {
+    sorriso();
+
+  }
+  
+  if (umidade <= 60.0 && umidade >= 40.0) {
+    sorrisoNeutro();
+
+  }
+  
+  if (umidade < 39.0) {
+    triste();
+  }
+
+}
+
+//-----------------------------OLHOS----------------------------------------
+void olhoPadrao(){
+  //olho esquerdo
+  desenharFigura(7, 0, 1, 1, 0);  // (x, y, largura, altura, formato)
+  desenharFigura(8, 0, 1, 1, 2);
+  desenharFigura(7, 1, 1, 1, 3);
+  desenharFigura(8, 1, 1, 1, 4);
+
+  //olho direito
+  desenharFigura(11, 0, 1, 1, 0);
+  desenharFigura(12, 0, 1, 1, 2);
+  desenharFigura(11, 1, 1, 1, 3);
+  desenharFigura(12, 1, 1, 1, 4);
+}
+
+//-------------------------------Expressões---------------------------------
+
+void sorriso(){
+  lcd.clear();
+
+  //olhos
+  olhoPadrao();
+
+  //boca
+  desenharFigura(7, 3, 6, 1, 7); // (coluna, linha, largura, altura, formato)
+  desenharFigura(6, 3, 1, 1, 6);
+  desenharFigura(5, 2, 1, 1, 7);
+  desenharFigura(13, 3, 1, 1, 6);
+  desenharFigura(14, 2, 1, 1, 7);
+}
+
+void piscadinha(){
+  lcd.clear();
+
+  sorriso();
+  
+  delay(2000);
+
+  lcd.clear();
+
+  //olho esquerdo
+  desenharFigura(7, 0, 1, 1, 0);  // (x, y, largura, altura, formato)
+  desenharFigura(8, 0, 1, 1, 2);
+  desenharFigura(7, 1, 1, 1, 3);
+  desenharFigura(8, 1, 1, 1, 4);
+
+  //olho direito
+  desenharFigura(11, 1, 3, 1, 7);
+
+  //boca
+  desenharFigura(7, 3, 6, 1, 7); // (coluna, linha, largura, altura, formato)
+  desenharFigura(6, 3, 1, 1, 6);
+  desenharFigura(13, 3, 1, 1, 6);
+  desenharFigura(14, 2, 1, 1, 7);
+
+  delay(800);
+
+  lcd.clear();
+  sorriso();
+
+  delay(1000);
+}
+
+void sorrisoNeutro(){
+  lcd.clear();
+ 
+  //olhos
+  olhoPadrao();
+
+  //boca
+  desenharFigura(8, 3, 4, 1, 6); // (coluna, linha, largura, altura, formato)
+}
+
+void triste(){
+  lcd.clear();
+
+  //olhos
+  olhoPadrao();
+
+  //boca
+  desenharFigura(8, 2, 4, 1, 7); // (coluna, linha, largura, altura, formato)
+  desenharFigura(6, 3, 2, 1, 6);
+  desenharFigura(6, 3, 1, 1, 7);
+  desenharFigura(12, 3, 1, 1, 6);
+  desenharFigura(13, 3, 1, 1, 7);
+}
+
+void dormindo(){
+  lcd.clear();
+  //-----------------------------boca fase 0 --------------------------------------
+  //olho esquerdo
+  desenharFigura(6, 1, 3, 1, 7);  // (x, y, largura, altura, formato)
+
+  //olho direito
+  desenharFigura(12, 1, 3, 1, 7);
+
+  //boca fechada
+  desenharFigura(12, 3, 1, 1, 0); // (coluna, linha, largura, altura, formato)
+  delay(1500);
+
+  //-----------------------------boca fase 1 --------------------------------------
+  lcd.clear();
+  //olho esquerdo
+  desenharFigura(6, 1, 3, 1, 6);  // (x, y, largura, altura, formato)
+
+  //olho direito
+  desenharFigura(12, 1, 3, 1, 6);
+
+  //boca aberta
+  desenharFigura(10, 2, 1, 1, 1); // (coluna, linha, largura, altura, formato)
+  desenharFigura(10, 3, 1, 1, 3); // (coluna, linha, largura, altura, formato)
+  desenharFigura(11, 2, 1, 1, 2); // (coluna, linha, largura, altura, formato)
+  desenharFigura(11, 3, 1, 1, 4); // (coluna, linha, largura, altura, formato)
+  
+  lcd.setCursor(15, 3);
+  lcd.print("z");
+  delay(1500);
+
+  //-----------------------------boca fase 2 --------------------------------------
+  lcd.clear();
+   //olho esquerdo
+  desenharFigura(6, 1, 3, 1, 7);  // (x, y, largura, altura, formato)
+
+  //olho direito
+  desenharFigura(12, 1, 3, 1, 7);
+
+  //boca fechada
+  desenharFigura(12, 3, 1, 1, 0); // (coluna, linha, largura, altura, formato)
+
+  lcd.setCursor(15, 3);
+  lcd.print("z");
+  lcd.setCursor(16, 2);
+  lcd.print("Z");
+  delay(1500);
+
+  //-----------------------------boca fase 3 --------------------------------------
+  lcd.clear();
+  //olho esquerdo
+  desenharFigura(6, 1, 3, 1, 6);  // (x, y, largura, altura, formato)
+
+  //olho direito
+  desenharFigura(12, 1, 3, 1, 6);
+
+  //boca aberta
+  desenharFigura(10, 2, 1, 1, 1); // (coluna, linha, largura, altura, formato)
+  desenharFigura(10, 3, 1, 1, 3); // (coluna, linha, largura, altura, formato)
+  desenharFigura(11, 2, 1, 1, 2); // (coluna, linha, largura, altura, formato)
+  desenharFigura(11, 3, 1, 1, 4); // (coluna, linha, largura, altura, formato)
+
+  lcd.setCursor(15, 3);
+  lcd.print("z");
+  lcd.setCursor(16, 2);
+  lcd.print("Z");
+  desenharFigura(17, 1, 1, 1, 5); // (coluna, linha, largura, altura, formato)
+  delay(1500);
+
+}
+
+void frio(){
+  //---------------Neve fase 0---------------------
+  lcd.clear();
+
+  //olho esquerdo
+  desenharFigura(7, 0, 1, 1, 1);  // (x, y, largura, altura, formato)
+  desenharFigura(8, 0, 1, 1, 2);
+  desenharFigura(7, 1, 1, 1, 0);
+  desenharFigura(8, 1, 1, 1, 0);
+
+  //olho direito
+  desenharFigura(11, 0, 1, 1, 1);
+  desenharFigura(12, 0, 1, 1, 2);
+  desenharFigura(11, 1, 1, 1, 0);
+  desenharFigura(12, 1, 1, 1, 0);
+
+ //boca
+  desenharFigura(8, 3, 4, 1, 6); // (coluna, linha, largura, altura, formato)
+
+  lcd.setCursor(2, 0);
+  lcd.print("*");
+
+  lcd.setCursor(5, 0);
+  lcd.print("*");
+
+  lcd.setCursor(17, 0);
+  lcd.print("*");
+
+  delay(1000);
+
+//---------------Neve fase 1---------------------
+  lcd.clear();
+
+  //olho esquerdo
+  desenharFigura(7, 0, 1, 1, 1);  // (x, y, largura, altura, formato)
+  desenharFigura(8, 0, 1, 1, 2);
+  desenharFigura(7, 1, 1, 1, 0);
+  desenharFigura(8, 1, 1, 1, 0);
+
+  //olho direito
+  desenharFigura(11, 0, 1, 1, 1);
+  desenharFigura(12, 0, 1, 1, 2);
+  desenharFigura(11, 1, 1, 1, 0);
+  desenharFigura(12, 1, 1, 1, 0);
+
+ //boca
+  desenharFigura(8, 3, 4, 1, 6); // (coluna, linha, largura, altura, formato)
+
+  lcd.setCursor(3, 1);
+  lcd.print("*");
+
+  lcd.setCursor(4, 3);
+  lcd.print("*");
+
+  lcd.setCursor(17, 2);
+  lcd.print("*");
+  lcd.setCursor(18, 0);
+  lcd.print("*");
+
+  delay(1000);
+
+//---------------Neve fase 2---------------------
+  lcd.clear();
+
+  //olho esquerdo
+  desenharFigura(7, 0, 1, 1, 1);  // (x, y, largura, altura, formato)
+  desenharFigura(8, 0, 1, 1, 2);
+  desenharFigura(7, 1, 1, 1, 0);
+  desenharFigura(8, 1, 1, 1, 0);
+
+  //olho direito
+  desenharFigura(11, 0, 1, 1, 1);
+  desenharFigura(12, 0, 1, 1, 2);
+  desenharFigura(11, 1, 1, 1, 0);
+  desenharFigura(12, 1, 1, 1, 0);
+
+ //boca
+  desenharFigura(8, 3, 4, 1, 6); // (coluna, linha, largura, altura, formato)
+
+  lcd.setCursor(0, 0);
+  lcd.print("*");
+  lcd.setCursor(3, 2);
+  lcd.print("*");
+  lcd.setCursor(2, 3);
+  lcd.print("*");
+  lcd.setCursor(5, 4);
+  lcd.print("*");
+
+  lcd.setCursor(19, 1);
+  lcd.print("*");
+  lcd.setCursor(16, 3);
+  lcd.print("*");
+  lcd.setCursor(15, 2);
+  lcd.print("*");
+
+  delay(1000);
+
+}
+
+//Desenha o retângulo no Display 20x4
+void desenharFigura(int coluna, int linha, int largura, int altura, int formato) {
+  for (int y = 0; y < altura; y++) {
+    for (int x = 0; x < largura; x++) {
+      lcd.setCursor(coluna + x, linha + y);
+      lcd.write(byte(formato));
+    }
+  }
+}
